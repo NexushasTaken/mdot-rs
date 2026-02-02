@@ -1,6 +1,7 @@
 use colored::*;
 use dirs;
 use log::{error, info, warn};
+use mlua::prelude::*;
 use mlua::{Function, Lua, Table, TablePairs, Value};
 use std::collections::HashMap;
 use std::env;
@@ -46,29 +47,47 @@ macro_rules! fatal {
     }};
 }
 
+fn lua_value_to_str(val: &Value) -> String {
+    match val {
+        Value::String(_) => val
+            .to_string()
+            .map_err(|_| fatal!("Field contains invalid UTF-8 bytes"))
+            .unwrap()
+            .to_string(),
+        _ => fatal!("expected type 'String', got {:#?}", val),
+    }
+}
+
+fn lua_str_to_str(val: &mlua::String) -> String {
+    val.to_str()
+        .map_err(|_| fatal!("Field contains invalid UTF-8 bytes"))
+        .unwrap()
+        .to_string()
+}
+
 type OSPackage = HashMap<String, String>;
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
 enum OSPackageName {
     AsPackage(bool),
     Name(String),
     Package(OSPackage),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
 enum Enabled {
     Enable(bool),
     Hook(Function),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
 struct LinkObject {
     source: PathBuf,
-    target: PathBuf,
+    targets: Vec<PathBuf>,
     overwrite: bool,
     backup: bool,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, PartialEq, Clone)]
 struct Package {
     name: Option<String>,
     package_name: Option<OSPackageName>,
@@ -105,6 +124,94 @@ impl Package {
         }
     }
 
+    fn parse_target_list(targets: Value) -> Vec<PathBuf> {
+        match targets {
+            Value::String(target) => vec![PathBuf::from(lua_str_to_str(&target))],
+            Value::Table(target_list) => {
+                let mut links: Vec<PathBuf> = Vec::new();
+                for pair in target_list.pairs::<Value, Value>() {
+                    match pair.unwrap() {
+                        (Value::Integer(_), Value::String(target)) => {
+                            links.push(PathBuf::from(lua_str_to_str(&target)));
+                        }
+                        (k, v) => {
+                            fatal!("Link invalid target element: [{:#?}] = {:#?}", k, v);
+                        }
+                    }
+                }
+                links
+            }
+            _ => {
+                fatal!("Link invalid targets value: '{:#?}'", targets);
+            }
+        }
+    }
+
+    fn extract_links(tbl: &Table) -> Option<Vec<LinkObject>> {
+        let mut links: Vec<LinkObject> = Vec::new();
+        for pair in tbl.pairs::<Value, Value>() {
+            let (key, value): (Value, Value) = pair.unwrap();
+            match (key, value) {
+                (Value::Integer(_), Value::Table(tbl)) => {
+                    // TODO: why get::<String> converts the value number into string? hence, the value type can be either number or string.
+                    let source_val: Value = tbl.get("source").unwrap();
+                    let targets_val: Value = tbl.get("targets").unwrap();
+                    let overwrite_val: Value = tbl.get("overwrite").unwrap();
+                    let backup_val: Value = tbl.get("backup").unwrap();
+
+                    let source: String = match source_val {
+                        Value::String(_) => lua_value_to_str(&source_val),
+                        Value::Nil => fatal!("Link must contain 'source'"),
+                        _ => fatal!("Link 'source' expected type 'String', got {:?}", source_val),
+                    };
+                    let targets = match targets_val {
+                        Value::String(_) | Value::Table(_) => {
+                            Package::parse_target_list(targets_val)
+                        }
+                        Value::Nil => fatal!("Link must contain 'targets'"),
+                        _ => fatal!(
+                            "Link 'targets' expected type 'String' or 'Table', got {:?}",
+                            targets_val
+                        ),
+                    };
+                    let overwrite = match overwrite_val {
+                        Value::Boolean(_) => overwrite_val,
+                        Value::Nil => Value::Boolean(false),
+                        _ => fatal!(
+                            "Link 'overwrite' expected type 'Boolean', got {:?}",
+                            overwrite_val
+                        ),
+                    };
+                    let backup = match backup_val {
+                        Value::Boolean(_) => backup_val,
+                        Value::Nil => Value::Boolean(false),
+                        _ => fatal!(
+                            "Link 'backup' expected type 'Boolean', got {:?}",
+                            backup_val
+                        ),
+                    };
+                    links.push(LinkObject {
+                        source: PathBuf::from(source),
+                        targets: targets,
+                        overwrite: overwrite.as_boolean().unwrap(),
+                        backup: backup.as_boolean().unwrap(),
+                    });
+                }
+                (Value::String(source), Value::Table(targets)) => {
+                    links.push(LinkObject {
+                        source: PathBuf::from(lua_str_to_str(&source)),
+                        targets: Package::parse_target_list(Value::Table(targets)),
+                        overwrite: false,
+                        backup: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+        info!("{:#?}", links);
+        if links.is_empty() { None } else { Some(links) }
+    }
+
     fn from_table(name: Option<String>, tbl: &Table) -> Self {
         // todo!(); // Table -> Package
         let mut package: Option<Package> = None;
@@ -134,13 +241,20 @@ impl Package {
                 }
             }
         }
-        if let Some(pkg) = package {
+        if let Some(mut pkg) = package {
             for pair in tbl.pairs::<Value, Value>() {
-                let (k, value) = pair.unwrap();
+                let (k, value): (Value, Value) = pair.unwrap();
 
                 if let Value::String(lua_key) = k {
-                    let key: &str = &lua_key.to_str().unwrap().to_string();
+                    let key: &str = &lua_str_to_str(&lua_key);
                     match key {
+                        "links" => {
+                            if let Some(tbl) = value.as_table() {
+                                pkg.links = Package::extract_links(&tbl);
+                            } else {
+                                fatal!("expected 'Table', found '{:?}'", value);
+                            }
+                        }
                         "name" => (),
                         _ => warn!("key '{}' is ignored", key),
                     }
@@ -154,21 +268,94 @@ impl Package {
     fn from_pair(pair: (&Value, &Value)) -> Option<Package> {
         match pair {
             (Value::Integer(_), Value::String(name)) => {
-                return Some(Package::new(name.to_str().ok()?.to_string()));
+                return Some(Package::new(lua_str_to_str(name)));
             }
             (Value::Integer(_), Value::Table(tbl)) => {
                 return Some(Package::from_table(None, tbl));
             }
             (Value::String(name), Value::Table(tbl)) => {
-                return Some(Package::from_table(
-                    Some(name.to_str().unwrap().to_string()),
-                    tbl,
-                ));
+                return Some(Package::from_table(Some(lua_str_to_str(name)), tbl));
             }
             (key, value) => {
                 fatal!("Unsupported package format: {:?} = {:?}", key, value);
             }
         }
+    }
+}
+
+struct Context {
+    lua: Lua,
+    config_path: PathBuf,
+}
+
+impl Context {
+    fn new() -> Self {
+        let app_name = env::var("MDOT_APPNAME").unwrap_or(APP_NAME.to_string());
+        let config_dir = dirs::config_dir().unwrap();
+        let mut config_path = PathBuf::from(config_dir);
+        config_path.push(app_name);
+        Self {
+            lua: Lua::new(),
+            config_path: config_path,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn test_package_string() {
+        let _ = setup_logger();
+        let ctx = Context::new();
+        let s = ctx.lua.create_string("foo").unwrap();
+        let e = Package::new("foo".to_string());
+        assert_eq!(
+            Package::from_pair((&Value::Integer(1), &Value::String(s))),
+            Some(e)
+        );
+    }
+
+    #[test]
+    fn test_package_table() {
+        let _ = setup_logger();
+        let ctx = Context::new();
+        let name_foo = "foo".into_lua(&ctx.lua).unwrap();
+        let name_bar = "bar".into_lua(&ctx.lua).unwrap();
+        let name_name = "name".into_lua(&ctx.lua).unwrap();
+        let expected = Some(Package::new("foo".to_string()));
+
+        let tbl = ctx.lua.create_table().unwrap();
+        tbl.set(1, &name_foo).unwrap();
+
+        assert_eq!(
+            Package::from_pair((&Value::Integer(1), &Value::Table(tbl.clone()))),
+            expected
+        );
+
+        tbl.set(1, &name_bar).unwrap();
+        assert_eq!(
+            Package::from_pair((&name_foo, &Value::Table(tbl.clone()))),
+            expected
+        );
+
+        tbl.set(1, &name_bar).unwrap();
+        tbl.set(name_name.clone(), &name_bar).unwrap();
+        assert_eq!(
+            Package::from_pair((&name_foo, &Value::Table(tbl.clone()))),
+            expected
+        );
+        tbl.set(name_name.clone(), Value::Nil).unwrap();
+        assert_eq!(
+            Package::from_pair((&name_foo, &Value::Table(tbl.clone()))),
+            expected
+        );
+        tbl.set(1, Value::Nil).unwrap();
+        assert_eq!(
+            Package::from_pair((&name_foo, &Value::Table(tbl.clone()))),
+            expected
+        );
     }
 }
 
@@ -192,21 +379,14 @@ fn setup_logger() -> Result<(), fern::InitError> {
         })
         .level(log::LevelFilter::Debug)
         .chain(std::io::stdout())
-        .chain(fern::log_file("output.log")?)
         .apply()?;
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logger()?;
-    let app_name = env::var("MDOT_APPNAME").unwrap_or(APP_NAME.to_string());
-    let config_dir = dirs::config_dir().unwrap();
-
-    let mut config_path = PathBuf::from(config_dir);
-    config_path.push(app_name);
-
-    let lua = Lua::new();
-    let conf = lua.load(
+    let ctx = Context::new();
+    let conf = ctx.lua.load(
         r#"
   return {
     "ly",
@@ -229,8 +409,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     },
     {
         name = "alacritty",
+        links = {
+            {
+                source = "src",
+                targets = "tar",
+            },
+            ["key-src"] = "value-tar"
+        },
     },
     {
+        links = {
+            {
+                source = "src",
+                targets = "tar",
+                overwrite = false,
+                backup = true,
+            },
+        },
         "tmux",
     }
   }
