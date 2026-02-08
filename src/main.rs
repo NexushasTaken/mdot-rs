@@ -79,6 +79,12 @@ enum Enabled {
     Hook(Function),
 }
 
+impl Default for Enabled {
+    fn default() -> Self {
+        Enabled::Enable(true)
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 struct LinkObject {
     source: PathBuf,
@@ -89,20 +95,20 @@ struct LinkObject {
 
 #[derive(Default, Debug, PartialEq, Clone)]
 struct Package {
-    name: Option<String>,
+    name: String,
     package_name: Option<OSPackageName>,
     // enabled: bool,
-    enabled: Option<Enabled>,
-    depends: Option<Vec<Package>>,
-    links: Option<Vec<LinkObject>>,
-    excludes: Option<Vec<PathBuf>>,
-    templates: Option<Vec<PathBuf>>,
+    enabled: Enabled,
+    depends: Vec<Package>,
+    links: Vec<LinkObject>,
+    excludes: Vec<PathBuf>,
+    templates: Vec<PathBuf>,
 }
 
 impl Package {
     fn new(name: String) -> Self {
         Self {
-            name: Some(name),
+            name,
             ..Default::default()
         }
     }
@@ -141,75 +147,80 @@ impl Package {
                 }
                 links
             }
-            _ => {
-                fatal!("Link invalid targets value: '{:#?}'", targets);
-            }
+            v => fatal!(
+                "Link 'targets' expected type 'String' or 'Table', got {:?}",
+                v
+            ),
         }
     }
 
-    fn extract_links(tbl: &Table) -> Option<Vec<LinkObject>> {
-        let mut links: Vec<LinkObject> = Vec::new();
-        for pair in tbl.pairs::<Value, Value>() {
-            let (key, value): (Value, Value) = pair.unwrap();
-            match (key, value) {
-                (Value::Integer(_), Value::Table(tbl)) => {
-                    // TODO: why get::<String> converts the value number into string? hence, the value type can be either number or string.
-                    let source_val: Value = tbl.get("source").unwrap();
-                    let targets_val: Value = tbl.get("targets").unwrap();
-                    let overwrite_val: Value = tbl.get("overwrite").unwrap();
-                    let backup_val: Value = tbl.get("backup").unwrap();
-
-                    let source: String = match source_val {
-                        Value::String(_) => lua_value_to_str(&source_val),
-                        Value::Nil => fatal!("Link must contain 'source'"),
-                        _ => fatal!("Link 'source' expected type 'String', got {:?}", source_val),
-                    };
-                    let targets = match targets_val {
-                        Value::String(_) | Value::Table(_) => {
-                            Package::parse_target_list(targets_val)
+    fn extract_links(tbl: &Table) -> Vec<LinkObject> {
+        tbl.pairs::<Value, Value>()
+            .map(|pair| {
+                let (key, value): (Value, Value) = pair.unwrap();
+                match (key, value) {
+                    (Value::Integer(_), Value::Table(tbl)) => {
+                        let source: String = match tbl.get("source").unwrap() {
+                            Value::String(s) => lua_str_to_str(&s),
+                            Value::Nil => fatal!("Link must contain 'source'"),
+                            v => fatal!("Link 'source' expected type 'String', got {:?}", v),
+                        };
+                        let targets = match tbl.get("targets").unwrap() {
+                            Value::Nil => fatal!("Link must contain 'targets'"),
+                            v => Package::parse_target_list(v),
+                        };
+                        let overwrite = match tbl.get("overwrite").unwrap() {
+                            Value::Boolean(v) => v,
+                            Value::Nil => false,
+                            v => fatal!("Link 'overwrite' expected type 'Boolean', got {:?}", v),
+                        };
+                        let backup = match tbl.get("backup").unwrap() {
+                            Value::Boolean(v) => v,
+                            Value::Nil => false,
+                            v => fatal!("Link 'backup' expected type 'Boolean', got {:?}", v),
+                        };
+                        LinkObject {
+                            source: PathBuf::from(source),
+                            targets: targets,
+                            overwrite: overwrite,
+                            backup: backup,
                         }
-                        Value::Nil => fatal!("Link must contain 'targets'"),
-                        _ => fatal!(
-                            "Link 'targets' expected type 'String' or 'Table', got {:?}",
-                            targets_val
-                        ),
-                    };
-                    let overwrite = match overwrite_val {
-                        Value::Boolean(_) => overwrite_val,
-                        Value::Nil => Value::Boolean(false),
-                        _ => fatal!(
-                            "Link 'overwrite' expected type 'Boolean', got {:?}",
-                            overwrite_val
-                        ),
-                    };
-                    let backup = match backup_val {
-                        Value::Boolean(_) => backup_val,
-                        Value::Nil => Value::Boolean(false),
-                        _ => fatal!(
-                            "Link 'backup' expected type 'Boolean', got {:?}",
-                            backup_val
-                        ),
-                    };
-                    links.push(LinkObject {
-                        source: PathBuf::from(source),
-                        targets: targets,
-                        overwrite: overwrite.as_boolean().unwrap(),
-                        backup: backup.as_boolean().unwrap(),
-                    });
-                }
-                (Value::String(source), Value::Table(targets)) => {
-                    links.push(LinkObject {
+                    }
+                    (Value::String(source), v) => LinkObject {
                         source: PathBuf::from(lua_str_to_str(&source)),
-                        targets: Package::parse_target_list(Value::Table(targets)),
+                        targets: Package::parse_target_list(v),
                         overwrite: false,
                         backup: false,
-                    });
+                    },
+                    (key, value) => {
+                        fatal!("expected Link element, found {:#?} = {:#?}", key, value);
+                    }
                 }
-                _ => {}
+            })
+            .collect()
+    }
+
+    fn extract_targets(value: &Value) -> Vec<PathBuf> {
+        match value {
+            Value::String(target) => {
+                return vec![PathBuf::from(lua_value_to_str(value))];
+            }
+            Value::Table(targets) => {
+                return targets
+                    .sequence_values::<Value>()
+                    .map(|v| match v.clone().unwrap() {
+                        Value::String(target) => PathBuf::from(lua_str_to_str(&target)),
+                        _ => {
+                            fatal!("expected 'String', found {:#?}", v);
+                        }
+                    })
+                    .collect();
+            }
+            _ => {
+                fatal!("expected 'String' or 'Table', found {:#?}", value);
             }
         }
-        info!("{:#?}", links);
-        if links.is_empty() { None } else { Some(links) }
+        Vec::new()
     }
 
     fn from_table(name: Option<String>, tbl: &Table) -> Self {
@@ -256,6 +267,12 @@ impl Package {
                             }
                         }
                         "name" => (),
+                        "excludes" => {
+                            pkg.excludes = Package::extract_targets(&value);
+                        }
+                        "templates" => {
+                            pkg.templates = Package::extract_targets(&value);
+                        }
                         _ => warn!("key '{}' is ignored", key),
                     }
                 }
@@ -406,16 +423,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         depends = {
           "hypr",
         },
+        excludes = { "as_table", "second" },
+        templates = { "as_templates", "second" },
     },
     {
         name = "alacritty",
         links = {
             {
                 source = "src",
-                targets = "tar",
+                targets = { "tar", "hello" },
             },
             ["key-src"] = "value-tar"
         },
+        excludes = "as_string",
+        templates = "as_templates",
     },
     {
         links = {
